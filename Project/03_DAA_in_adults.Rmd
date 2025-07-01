@@ -1,0 +1,380 @@
+---
+title: "03_DAA_in_adults"
+author: "Anna Chamot"
+date: '2025-06-27'
+output: html_document
+---
+
+```{r setup, include=FALSE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+```{r, verbose = FALSE}
+# Load all required libraries for the workflow (suppress startup messages for cleaner output)
+suppressPackageStartupMessages({
+  library(DiffBind)
+  library(dplyr)
+  library(rtracklayer)
+  library(Rsamtools)
+  library(cowplot)
+  library(readxl)
+  library(ggplot2)
+  library(jsonlite)
+  library(reshape2)
+  library(edgeR)
+  library(DESeq2)
+  library(csaw)
+  library(ChIPseeker)
+  library(ChIPpeakAnno)
+  library(heatmaply)
+  library(SummarizedExperiment)
+  library(SEtools)
+  library(EnhancedVolcano)
+  library(pheatmap)
+  library(dichromat)
+  library(gprofiler2)
+  library(limma)
+})
+```
+
+# ATAC-seq differential accessibility analysis Pipeline  
+This notebook loads curated sample/quality metadata, prepares data for consensus peak analysis, performs SVA, differential analysis, and saves annotated results for downstream interpretation.  
+
+## 3.1 Load QC/metadata table
+```{r, verbose = FALSE}
+# Load pre-compiled pheno.csv table (curated sample and QC metadata)
+pheno <- read.csv("/mnt/IM/groupMansuy/anna/Bioinformatics_project/ATAC/pheno.csv")
+rownames(pheno) <- pheno$Sample
+```
+
+## 3.2 Set analysis parameters and output folders
+```{r, verbose = FALSE}
+# Set main variables for your experiment (customize as needed)
+bamdir <- "/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/08_NF/"
+peakdir <- "/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/09_peaks/"
+outputdir <- "/mnt/groupMansuy/anna/Bioinformatics_project/ATAC/results/dea_04/"
+
+strain <- "B6"
+generation <- "F1"
+sex <- "Male"
+Sub_age <- "ad"   # or "P15"
+exclude <- NULL   
+VarExp <- "Condition"
+CtrGroup <- "Control"
+ExpGroup <- "MSUS"
+CovarBio <- NULL
+CovarTec <- NULL
+VarNested <- NULL
+suffix <- "Basemodel"
+minOverlap <- 0.3 # Minimum overlap for consensus peak
+```
+
+```{r, verbose = FALSE}
+# Create output directory
+dirname <- paste0(paste0(strain, collapse = "+"),"-",generation,"-",paste0(sex, collapse = "+"), "-", paste0(Sub_age, collapse = "+"), "-", suffix, "/")
+  
+if (!file.exists(paste0(outputdir, "/", dirname))){
+    dir.create(paste0(outputdir, "/", dirname))
+  }
+```
+
+## 3.3 Prepare sample sheet for DiffBind
+```{r, verbose = FALSE}
+# Define groups for analysis (by AgePrefix and Condition)
+ctr <- pheno$Sample[pheno$AgePrefix %in% Sub_age & pheno$Condition == CtrGroup & !(pheno$Sample %in% exclude)]
+msus <- pheno$Sample[pheno$AgePrefix %in% Sub_age & pheno$Condition == ExpGroup & !(pheno$Sample %in% exclude)]
+
+# Create a data.frame with required DiffBind sample columns
+samples <- data.frame(SampleID = c(ctr, msus), Tissue = "SSC", Factor = "ATAC", Condition = pheno$Condition[match(c(ctr, msus), pheno$Sample)], Treatment = NA, Replicate = c(seq_along(ctr), seq_along(msus)), bamReads = paste0(bamdir, c(ctr, msus), ".bam"), Peaks = paste0(peakdir, c(ctr, msus), "_peaks.narrowPeak"), PeakCaller = "narrow")
+nCtr <- length(ctr)
+nExp <- length(msus)
+```
+
+
+## 3.4 Build consensus peakset & SummarizedExperiment
+```{r, verbose = FALSE, message=FALSE}
+# Run DiffBind to call consensus peaks, count and normalize
+ATAC.dba <- dba(sampleSheet = samples, peakCaller = "narrow", minOverlap = minOverlap)
+ATAC.dba <- dba.count(ATAC.dba, bParallel=TRUE)
+ATAC.dba <- dba.normalize(ATAC.dba)
+
+# Extract consensus peaks and match sample sheet to counts
+ATAC.ranges <- dba.peakset(ATAC.dba, bRetrieve = TRUE, DataType = DBA_DATA_GRANGES)
+colnames(samples)[1] <- "Sample"
+samples <- dplyr::left_join(samples, pheno, by = "Sample")
+
+# Check sample ordering matches
+stopifnot(identical(samples$Sample, colnames(mcols(ATAC.ranges))))
+
+# Remove extra metadata from peaks, keep only coordinates and counts
+if (identical(samples$Condition.x, samples$Condition.y)) {
+  samples$Condition <- samples$Condition.x
+}
+gr <- ATAC.ranges
+mcols(gr) <- NULL
+
+# Construct a SummarizedExperiment (SE) object for analysis
+se <- SummarizedExperiment(assays = list(counts = as.matrix(mcols(ATAC.ranges))), rowRanges = gr, colData = DataFrame(samples))
+
+# Normalize and add logCPM
+countsLvl <- DGEList(assays(se)$counts)
+countsLvl <- calcNormFactors(countsLvl, method = "TMM")
+assays(se)$logcpm <- log1p(cpm(countsLvl))
+
+# Save SE object for reproducibility
+saveRDS(se, file = file.path(outputdir, dirname, "SE.rds"))
+```
+
+## 3.5 Check PCA before SVA
+```{r, verbose = FALSE}
+# Plot PCA before SVA correction
+pc_bef <- as.data.frame(prcomp(t(assays(se)$counts))$x)
+varexplained <- paste(round(summary(prcomp(t(assays(se)$counts)))$importance[2, ] * 100, 2), "%")
+plotPCAbeforeSVA <- ggplot(pc_bef, aes(x = PC1, y = PC2, col = colData(se)$Condition)) + geom_point(size = 4) + geom_text(label = colnames(se), nudge_x = 0.25, nudge_y = 0.25) + labs(colour = "Condition") + xlab(paste("PC1", varexplained[1])) + ylab(paste("PC2", varexplained[2])) + ggtitle("Not adjusted for SVs") + theme_cowplot(10)
+
+print(plotPCAbeforeSVA)
+```
+ad_4 seems to be an outlier (as already suggested in the exploration of the data) and the dispersion of the samples across PC1 seems to be related to a batch effect considering the Tagmentation.date and Tagmentation.experimenter. In consequence, we will remove ad_4 from the analysis and use SVA to correct for know and hidden covariates.
+
+## Analysis excluding ad_4 sample
+
+## 3.1 Load QC/metadata table
+```{r, verbose = FALSE}
+# Load pre-compiled pheno.csv table (curated sample and QC metadata)
+pheno <- read.csv("/mnt/IM/groupMansuy/anna/Bioinformatics_project/ATAC/pheno.csv")
+pheno <- pheno[pheno$Sample_file_name != "M39F1ad_4", ]
+rownames(pheno) <- pheno$Sample
+```
+
+## 3.2 Set analysis parameters and output folders
+```{r, verbose = FALSE}
+# Set main variables for your experiment (customize as needed)
+bamdir <- "/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/08_NF/"
+peakdir <- "/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/09_peaks/"
+outputdir <- "/mnt/groupMansuy/anna/Bioinformatics_project/ATAC/results/dea_04/"
+
+strain <- "B6"
+generation <- "F1"
+sex <- "Male"
+Sub_age <- "ad"   # or "P15"
+exclude <- NULL   
+VarExp <- "Condition"
+CtrGroup <- "Control"
+ExpGroup <- "MSUS"
+CovarBio <- NULL
+CovarTec <- NULL
+VarNested <- NULL
+suffix <- "Basemodel"
+minOverlap <- 0.3 # Minimum overlap for consensus peak
+```
+
+```{r, verbose = FALSE}
+# Create output directory
+dirname <- paste0(paste0(strain, collapse = "+"),"-",generation,"-",paste0(sex, collapse = "+"), "-", paste0(Sub_age, collapse = "+"), "-", suffix, "/")
+  
+if (!file.exists(paste0(outputdir, "/", dirname))){
+    dir.create(paste0(outputdir, "/", dirname))
+  }
+```
+
+## 3.3 Prepare sample sheet for DiffBind
+```{r, verbose = FALSE}
+# Define groups for analysis (by AgePrefix and Condition)
+ctr <- pheno$Sample[pheno$AgePrefix %in% Sub_age & pheno$Condition == CtrGroup & !(pheno$Sample %in% exclude)]
+msus <- pheno$Sample[pheno$AgePrefix %in% Sub_age & pheno$Condition == ExpGroup & !(pheno$Sample %in% exclude)]
+
+# Create a data.frame with required DiffBind sample columns
+samples <- data.frame(
+  SampleID = c(ctr, msus),
+  Tissue = "SSC",
+  Factor = "ATAC",
+  Condition = pheno$Condition[match(c(ctr, msus), pheno$Sample)],
+  Treatment = NA,
+  Replicate = c(seq_along(ctr), seq_along(msus)),
+  bamReads = paste0(bamdir, c(ctr, msus), ".bam"),
+  Peaks = paste0(peakdir, c(ctr, msus), "_peaks.narrowPeak"),
+  PeakCaller = "narrow"
+)
+nCtr <- length(ctr)
+nExp <- length(msus)
+```
+
+## 3.4 Build consensus peakset & SummarizedExperiment
+```{r, verbose = FALSE, message=FALSE}
+# Run DiffBind to call consensus peaks, count and normalize
+ATAC.dba <- dba(sampleSheet = samples, peakCaller = "narrow", minOverlap = minOverlap)
+ATAC.dba <- dba.count(ATAC.dba)
+ATAC.dba <- dba.normalize(ATAC.dba)
+
+# Extract consensus peaks and match sample sheet to counts
+ATAC.ranges <- dba.peakset(ATAC.dba, bRetrieve = TRUE, DataType = DBA_DATA_GRANGES)
+colnames(samples)[1] <- "Sample"
+samples <- dplyr::left_join(samples, pheno, by = "Sample")
+
+# Check sample ordering matches
+stopifnot(identical(samples$Sample, colnames(mcols(ATAC.ranges))))
+
+# Remove extra metadata from peaks, keep only coordinates and counts
+if (identical(samples$Condition.x, samples$Condition.y)) {
+  samples$Condition <- samples$Condition.x
+}
+gr <- ATAC.ranges
+mcols(gr) <- NULL
+
+# Construct a SummarizedExperiment (SE) object for analysis
+se <- SummarizedExperiment(assays = list(counts = as.matrix(mcols(ATAC.ranges))), rowRanges = gr, colData = DataFrame(samples))
+
+# Normalize and add logCPM
+countsLvl <- DGEList(assays(se)$counts)
+countsLvl <- calcNormFactors(countsLvl, method = "TMM")
+assays(se)$logcpm <- log1p(cpm(countsLvl))
+
+# Save SE object for reproducibility
+saveRDS(se, file = file.path(outputdir, dirname, "SE.rds"))
+```
+
+## 3.5 Surrogate Variable Analysis (SVA) and model building
+```{r, verbose = FALSE}
+# Build design formulas for SVA, scaling covariates if provided (here we will not include other variables)
+if(!is.null(CovarTec)){
+  Covar.newname <- paste0(CovarTec, ".scaled")
+  colData(se)[,Covar.newname] <- NA
+  for (i in seq_along(CovarTec)) {
+    colData(se)[,Covar.newname[i]] <- as.numeric(scale(colData(se)[,CovarTec[i]]))
+  }
+  if (!is.null(CovarBio)){
+    basemodel <- paste0("~ ", VarExp, " + ", paste0(CovarBio, collapse = " + "), " + ", paste0(Covar.newname, collapse = " + "))
+    model.tec <- paste0("~ ", paste0(CovarBio, collapse = " + "), " + ", paste0(Covar.newname, collapse = " + "))
+  } else {
+    basemodel <- paste0("~ ", VarExp, " + ", paste0(Covar.newname, collapse = " + "))
+    model.tec <- paste0("~ ", paste0(Covar.newname, collapse = " + "))
+  }
+} else {
+  if (!is.null(CovarBio)){
+    basemodel <- paste0("~ ", VarExp, " + ", paste0(CovarBio, collapse = " + "))
+    model.tec <- paste0("~ ", paste0(CovarBio, collapse = " + "))
+  } else {
+    basemodel <- paste0("~ ", VarExp)
+    model.tec <- "~ 1"
+  }
+}
+form <- formula(basemodel)
+form0 <- formula(model.tec)
+
+# Run SVA and annotate surrogate variables in SE
+se <- SEtools::svacor(SE = se, form = form, form0 = form0)
+nSV <- sum(grepl("SV", colnames(colData(se))))
+```
+
+## 3.6 PCA plots before and after SVA
+```{r, verbose = FALSE}
+# Plot PCA before SVA correction
+pc_bef <- as.data.frame(prcomp(t(assays(se)$counts))$x)
+varexplained <- paste(round(summary(prcomp(t(assays(se)$counts)))$importance[2, ] * 100, 2), "%")
+plotPCAbeforeSVA <- ggplot(pc_bef, aes(x = PC1, y = PC2, col = colData(se)$Condition)) + geom_point(size = 4) + geom_text(label = colnames(se), nudge_x = 0.25, nudge_y = 0.25) + labs(colour = "Condition") + xlab(paste("PC1", varexplained[1])) + ylab(paste("PC2", varexplained[2])) + ggtitle("Not adjusted for SVs") + theme_cowplot(10)
+print(plotPCAbeforeSVA)
+```
+
+```{r, verbose = FALSE}
+# Plot PCA after SVA correction
+pc_adj <- as.data.frame(prcomp(t(assays(se)$corrected))$x)
+varexplained <- paste(round(summary(prcomp(t(assays(se)$corrected)))$importance[2, ] * 100, 2), "%")
+plotPCAafterSVA <- ggplot(pc_adj, aes(x = PC1, y = PC2, col = colData(se)$Condition)) + geom_point(size = 4) + geom_text(label = colnames(se), nudge_x = 0.25, nudge_y = 0.25, check_overlap = TRUE) + labs(colour = "Condition") + xlab(paste("PC1", varexplained[1])) + ylab(paste("PC2", varexplained[2])) + ggtitle(paste0("Adjusted PCs for ", nSV, " SVs")) + theme_cowplot(10)
+print(plotPCAafterSVA)
+```
+
+## 3.7 DAA (Differential Accessibility Analysis)
+```{r, verbose = FALSE}
+# Build DEA model matrix (include SVs if any)
+if (nSV > 0){
+  formulaDEA <- formula(paste0(basemodel, " + ", paste0("SV", c(1:nSV), collapse = " + ")))
+} else {
+  formulaDEA <- formula(basemodel)
+}
+design <- model.matrix(formulaDEA, data = colData(se))
+```
+
+```{r, verbose = FALSE}
+# Run edgeR-based differential analysis
+countsLvl <- DGEList(assays(se)$counts)
+countsLvl <- calcNormFactors(countsLvl, method = "TMM")
+cat(paste0("\nThe applied formula is: ", deparse(formulaDEA)))
+countsLvl <- estimateDisp(countsLvl, design)
+fit <- glmFit(countsLvl, design)
+lrt <- glmLRT(fit, coef = paste0("Condition", ExpGroup))
+
+res <- lrt$table
+res$padj <- p.adjust(res$PValue, method = "BH")
+nSignP <- sum(res$PValue < 0.05 & abs(res$logFC) > 0.5)
+nSignFDR <- sum(res$padj < 0.05 & abs(res$logFC) > 0.5)
+rowData(se)$dea <- res
+```
+
+```{r}
+# Save SE object with DAA results
+saveRDS(se, file = file.path(outputdir, dirname, "SE_afterDEA.rds"))
+```
+
+```{r}
+# Print description
+nPeaks <- nrow(se)
+cat(paste0("\nDEA was performed using ", nPeaks, " regions and using ", nSV, " SVs . \n", 
+            nSignP, " regions had a p Value < 0.05. ", nSignFDR, " regions had a FDR-adjusted p Value < 0.05\n"))
+```
+
+## 3.8 Visualizations & summary
+```{r, verbose = FALSE}
+# P value histogram
+plotPValueHist <- ggplot(as.data.frame(rowData(se)$dea), aes(x = PValue)) + geom_histogram(color="#e9ecef", alpha = 0.9, breaks = seq(0, 1, by = 0.05)) + xlab("P Values") + ylab("") + labs(title = "Histogram DEA P Values") + theme_cowplot()
+print(plotPValueHist)
+```
+
+```{r, verbose = FALSE}
+# Volcano plot
+res.vol <- rowData(se)$dea
+colnames(res.vol) <- c("logFC", "logCPM", "LR", "pvalue", "padj")
+res.vol$Gene <- gsub(".*\\.","", rownames(res.vol))
+lab_italics <- paste0("italic('", res.vol$Gene, "')")
+selectLab_italics = paste0("italic('",res.vol[res.vol$padj < 0.05,]$Gene,"')")
+
+VolPlot <- EnhancedVolcano(res.vol, lab = res.vol$Gene, x = "logFC", y = "pvalue", pointSize = 3, FCcutoff = 0.5, pCutoff  = 0.05, legendPosition = 'bottom', labSize = 0, legendIconSize = 4.0, ylim = c(0,-log10(min(res.vol$pvalue))+1), title = paste0("DEA"), subtitle = "", gridlines.major = F, gridlines.minor = F, caption = paste0("total = ", nrow(res.vol), " variables.\nSample size: Control = ", nCtr, ". ", ExpGroup, " = ", nExp))
+
+print(VolPlot)
+```
+
+```{r, verbose = FALSE}
+# MA Plot (requires external function, update path if needed)
+source("/mnt/groupMansuy/leo/LPD1/LiverRNA/scripts/maPlotfromSE.R")
+ma <- maPlotfromSE(se)
+print(ma)
+```
+
+```{r, verbose = FALSE}
+# Summary file of analysis parameters and results
+nPeaks <- nrow(se)
+summary <- as.data.frame(matrix(NA, nrow = 1, ncol = 14, dimnames = list(NULL, c("Strain", "Generation", "Sex", "Excluded", "VarExp", "CovarBio", "CovarTec", "VarNested", "Suffix", "Formula", "nSignP", "nSignFDR", "nSVs", "nPeaks"))))
+summary$Strain <- strain
+summary$Generation <- generation
+summary$Sex <- paste(sex, collapse = " + ")
+summary$Excluded <- exclude
+summary$VarExp <- VarExp
+summary$CovarBio <- paste(CovarBio, collapse = " + ")
+summary$CovarTec <- paste(CovarTec, collapse = " + ")
+summary$VarNested <- paste(VarNested, collapse = " + ")
+summary$Suffix <- suffix
+summary$Formula <- paste0(basemodel, " + ",paste0("SV", c(1:nSV), collapse = " + "))
+summary$nSignP <- nSignP
+summary$nSignFDR <- nSignFDR
+summary$nSVs <- nSV
+summary$nPeaks <- nPeaks
+write.csv(summary, file = file.path(outputdir, dirname, "summary.csv"), row.names = FALSE)
+saveRDS(se, file = file.path(outputdir, dirname, "SE_final.rds"))
+```
+
+## 3.10 Interpretation 
+The analysis assessed chromatin accessibility differences between spermatogonial stem cells (SSCs) from adult male mice exposed to early life stress (MSUS) and control animals. After initial quality control and principal component analysis (PCA), one sample (ad_4) was identified as a potential outlier likely due to batch effects and was excluded from further analysis. Surrogate Variable Analysis (SVA) was then used to account for both known and hidden sources of technical variation, with four significant surrogate variables identified and included in the differential analysis model.  
+The final differential accessibility analysis (DAA) was performed across 141,852 genomic regions (peaks), adjusting for these surrogate variables. Out of all tested regions, 2,936 showed a nominal p-value less than 0.05 with an absolute log fold change greater than 0.5, indicating potentially differential accessibility between MSUS and control conditions. However, none of these regions passed the more stringent false discovery rate (FDR) correction (padj < 0.05), suggesting that—when correcting for multiple testing—the study did not identify any regions with statistically significant differential chromatin accessibility between groups.  
+Visualization with PCA showed improved sample clustering after SVA correction, confirming that technical or batch effects were effectively mitigated. The p-value distribution appeared uniform with a slight excess of low p-values, but the volcano plot and MA plot did not highlight any regions meeting the FDR threshold for significance.
+
+In summary:  
+The analysis found no FDR-significant changes in chromatin accessibility between adult MSUS and control SSCs after adjusting for technical variation and multiple testing, despite some regions showing nominal significance. This result suggests that either early life stress does not lead to persistent, robust changes in chromatin accessibility detectable by ATAC-seq at adulthood in this model, or that any such changes are subtle and below the statistical power of the current dataset.

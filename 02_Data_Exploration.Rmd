@@ -1,0 +1,130 @@
+---
+title: "01_Data_Exploration"
+output: html_document
+date: '2025-06-24'
+---
+```{r setup-libs, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+suppressPackageStartupMessages({
+  library(ChIPseeker)
+  library(TxDb.Mmusculus.UCSC.mm10.knownGene)
+  library(org.Mm.eg.db)
+  library(GenomicRanges)
+  library(dplyr)
+  library(readr)
+  library(rtracklayer)
+  library(tibble)
+  library(ggplot2)
+  library(Rsubread)
+  library(tidyr)
+})
+```
+## Load Metadata and Peak Files
+```{r}
+pheno <- read_csv("pheno.csv", show_col_types = FALSE)
+```
+
+```{r}
+peak_folder <- "/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/10_filtered_peaks"
+peak_files <- list.files(peak_folder, pattern = "_peaks.narrowPeak$", full.names = TRUE)
+peak_ids <- gsub("_peaks.narrowPeak", "", basename(peak_files))
+```
+
+```{r}
+stopifnot(all(peak_ids %in% pheno$Sample_file_name))
+pheno_matched <- pheno[match(peak_ids, pheno$Sample_file_name), ]
+```
+## Peak Count QC
+```{r}
+peak_counts <- tibble(Sample = peak_ids, NumPeaks = sapply(peak_files, function(file) nrow(read.table(file)))); ggplot(peak_counts, aes(x = reorder(Sample, -NumPeaks), y = NumPeaks)) + geom_bar(stat = "identity", fill = "steelblue") + theme(axis.text.x = element_text(angle = 90, hjust = 1)) + xlab("Sample") + ylab("Number of Peaks") + ggtitle("Number of Peaks per Sample (pre-annotation)")
+
+```
+
+Most samples show consistent peak counts. Sample M39F1ad_4 has unusually high counts, possibly due to higher signal or sequencing depth.
+
+## Library Complexity (NRF)
+```{r}
+ggplot(pheno, aes(x = Condition, y = NRF)) + geom_boxplot() + facet_wrap(~ Age) + ggtitle("Non-Redundant Fraction by Condition")
+```
+
+NRF values are high across samples, indicating good library complexity. Slight variability appears in the PND15 group, but no major differences exist between Control and MSUS.
+
+## Genomic Annotation of Peaks
+```{r}
+annotations_list <- suppressMessages(lapply(peak_files, function(f) annotatePeak(readPeakFile(f), tssRegion = c(-3000, 3000), TxDb = TxDb.Mmusculus.UCSC.mm10.knownGene, annoDb = "org.Mm.eg.db", verbose = FALSE)))
+```
+```{r}
+for (i in seq_along(annotations_list)) {
+  annotations_list[[i]]@anno$Age <- pheno_matched$Age[i]
+  annotations_list[[i]]@anno$Condition <- pheno_matched$Condition[i]
+}
+```
+```{r}
+names(annotations_list) <- peak_ids
+```
+
+```{r}
+plotAnnoBar(annotations_list, xlab = "Genomic Region", by = "Condition")
+```
+Most peaks fall in intergenic and intronic regions, with fewer in promoters. This pattern is typical for ATAC-seq and consistent across samples, supporting annotation quality.
+
+## Distance to TSS
+```{r}
+plotDistToTSS(annotations_list, title = "Distance to TSS")
+```
+
+Many peaks cluster near the transcription start site (TSS), while others lie >10 kb away, suggesting distal regulatory elements. The symmetric distribution is typical for ATAC-seq and supports reliable peak detection.
+
+## Read Counting (featureCounts)
+```{r load-inputs, message=FALSE, warning=FALSE}
+bam_files <- list.files("/mnt/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/08_NF", pattern = "\\.bam$", full.names = TRUE)
+combined_peaks <- reduce(do.call(c, lapply(list.files("/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/01_preprocess/10_filtered_peaks", pattern = "_peaks.narrowPeak$", full.names = TRUE), import)))
+```
+
+
+```{r make-saf, message=FALSE}
+saf <- data.frame(GeneID = paste0("peak_", seq_along(combined_peaks)), Chr = as.character(seqnames(combined_peaks)), Start = start(combined_peaks), End = end(combined_peaks), Strand = "*")
+write.table(saf, saf_file <- tempfile(fileext = ".saf"), sep = "\t", quote = FALSE, row.names = FALSE)
+```
+
+```{r featurecounts, message=FALSE, warning=FALSE, results='hide'}
+invisible(capture.output(
+  counts <- suppressMessages(featureCounts(
+    files = bam_files, annot.ext = saf_file, isGTFAnnotationFile = FALSE,
+    isPairedEnd = TRUE, nthreads = 4, verbose = FALSE
+  ))
+))
+```
+
+```{r format-counts}
+counts_df <- as.data.frame(counts$counts)
+colnames(counts_df) <- sub("\\.bam$", "", basename(bam_files))
+counts_df$Peak <- saf$GeneID
+```
+
+## Variability Analysis
+```{r}
+ggplot(data.frame(m = rowMeans(counts_df[,-ncol(counts_df)]), s = apply(counts_df[,-ncol(counts_df)], 1, sd)), 
+       aes(x = m, y = s)) + 
+  geom_point(alpha = 0.4) + 
+  labs(x = "Peak Mean Counts", y = "Standard Deviation", title = "Peak Count Variability (Heteroscedasticity)")
+```
+The scatter plot displays each peak’s mean count vs. its variability (standard deviation) across samples. Peaks with higher average counts show more variability—a pattern known as heteroscedasticity, typical in ATAC-seq data. This highlights variation in signal strength and the need for normalization in downstream analyses.
+
+```{r}
+group_summary <- counts_df |> 
+  pivot_longer(-Peak, names_to = "Sample", values_to = "Count") |> 
+  left_join(pheno_matched, by = c("Sample" = "Sample_file_name")) |> 
+  group_by(Peak, Age, Condition) |> 
+  summarise(mean = mean(Count), sd = sd(Count), .groups = "drop")
+
+ggplot(group_summary, aes(x = mean, y = sd, color = Condition)) + 
+  geom_point(alpha = 0.5) + 
+  facet_wrap(~Age) + 
+  labs(x = "Mean Peak Counts", y = "Standard Deviation", title = "Peak Count Variability by Age and Condition") + 
+  theme_minimal()
+```
+Variability increases with peak counts across all groups, showing expected heteroscedasticity. No major differences are seen between Control and MSUS, though PND15 samples show slightly more spread.
+
+##Conclusion 
+This exploratory analysis confirms the overall quality and consistency of the ATAC-seq data across samples and experimental conditions. Peak detection appears robust, with minimal variability in total peak counts and strong library complexity. Genomic annotation reveals a typical distribution of peaks, enriched in distal and intronic regions, and consistent proximity to TSSs. Variability patterns across peaks and conditions are expected and do not suggest major technical biases, providing a solid foundation for downstream differential accessibility analysis.

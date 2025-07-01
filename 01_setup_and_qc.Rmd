@@ -1,0 +1,168 @@
+---
+title: "01_setup_and_qc"
+author: "Anna Chamot"
+date: '2025-06-27'
+output: html_document
+---
+
+
+```{r setup, include=FALSE}
+# Global setup chunk for knitr
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+```
+
+## 1.0 Load required libraries
+```{r, verbose = FALSE}
+# Load all required packages, suppressing startup messages for clarity
+suppressPackageStartupMessages({
+  library(DiffBind)        # Differential binding analysis for ATAC/ChIP-seq data
+  library(dplyr)           # Tidy data manipulation
+  library(rtracklayer)     # Import/export of genomic ranges (e.g., GTF, BED)
+  library(Rsamtools)       # Efficient BAM file access
+  library(cowplot)         # Enhanced ggplot2 visualizations
+  library(readxl)          # Reading Excel spreadsheets
+  library(ggplot2)         # Core plotting system
+  library(jsonlite)        # JSON parsing (for MultiQC reports)
+  library(reshape2)        # Data transformation (wide <-> long)
+  library(edgeR)           # RNA-seq/ATAC-seq count-based differential analysis
+  library(DESeq2)          # Alternative to edgeR for count-based analysis
+  library(csaw)            # Sliding window analysis of ChIP/ATAC-seq count data
+  library(ChIPseeker)      # Peak annotation and visualization
+  library(ChIPpeakAnno)    # Peak annotation for ChIP-seq data
+  library(heatmaply)       # Interactive heatmaps using plotly
+})
+```
+
+## 1.1 Read and format metadata
+```{r, verbose = FALSE}
+# Read metadata Excel file, skipping the first two rows:
+# - First row: title/description
+# - Second row: header to be assigned manually
+raw <- read_excel("/mnt/IM/groupMansuy/anna/Bioinformatics_project/ATAC/2025_omniATAC_SCs_MSUS39F1-PND15-Adult_metadata.xlsx", col_names = FALSE, skip = 2)
+
+# Assign proper column names from first actual row
+colnames(raw) <- as.character(unlist(raw[1, ]))
+
+# Remove the header row now stored as column names
+metadata <- raw[-1, ]
+metadata <- as.data.frame(metadata)
+rownames(metadata) <- NULL
+print(paste(colnames(metadata), collapse = ", "))
+print(dim(metadata))
+```
+
+## 1.2 Construct sample file names
+```{r, verbose = FALSE}
+# Ensure 'Age' and 'Samples name' are stored as character vectors
+metadata$Age <- as.character(metadata$Age)
+metadata[["Samples name"]] <- as.character(metadata[["Samples name"]])
+
+# Add age-based prefix for sample naming: 'ad' for Adult, 'P15' for PND15
+metadata$AgePrefix <- ifelse(metadata$Age == "Adult", "ad", ifelse(metadata$Age == "PND15", "P15", NA))
+
+# Construct file-compatible sample names (to match file system naming)
+metadata$Sample_file_name <- paste0("M39F1", metadata$AgePrefix, "_", metadata[["Samples name"]])
+```
+
+## 1.3 Integrate multiQC and quality metrics
+```{r, verbose = FALSE}
+# Create phenotype table from metadata
+pheno <- metadata
+rownames(pheno) <- pheno$Sample_file_name
+
+# Load MultiQC general statistics JSON from FastQC reports (trimmed FASTQ)
+multiQC_fastQ <- fromJSON("/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/02_qc_plots/02_FastQC_trimmed_data/multiqc_data/multiqc_data.json")$report_general_stats_data
+
+# Clean sample names in the JSON list for easier lookup
+names(multiQC_fastQ) <- gsub("results_mm10 | 02_qc_plots | 02_FastQC_trimmed_data | ", "", names(multiQC_fastQ), fixed = TRUE)
+
+# Pre-allocate columns in phenotype table for FastQC metrics
+pheno[, colnames(multiQC_fastQ[[1]])] <- NA
+
+# Fill in FastQC metrics by matching sample ID (forward read file)
+for (i in 1:nrow(pheno)) {
+  id <- paste0(rownames(pheno)[i], "_1_val_1")
+  pheno[i, colnames(multiQC_fastQ[[i]])] <- multiQC_fastQ[[grep(id, names(multiQC_fastQ))]]
+}
+```
+
+## 1.4 Clean and add quality variables
+```{r, verbose = FALSE}
+# Use concentration as proxy for RNA library quality
+pheno$RNA.conc <- pheno[, "Concentration ng/µl"]
+
+# Convert relevant variables to numeric for downstream analysis
+pheno[c("Cell count", "cycles PCR1", "cycles PCR2", "Concentration dilution 1:4 ng/µl (Qubit)", "Total volume µl", "RNA.conc")] <- 
+  lapply(pheno[c("Cell count", "cycles PCR1", "cycles PCR2", "Concentration dilution 1:4 ng/µl (Qubit)", "Total volume µl", "RNA.conc")], as.numeric)
+```
+
+## 1.5 Merge TSS and PBC metrics
+```{r, verbose = FALSE}
+# TSS score measures enrichment at transcription start sites (expected in high-quality ATAC)
+tss <- read.table("/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/02_qc_plots/04_tssscores/combined_TSS_Scores_allsamples.txt", header = TRUE, sep = "\t")
+tss$Sample <- sub("\\.sorted$", "", tss$Sample)  # Remove file suffix for matching
+colnames(tss)[colnames(tss) == "Sample"] <- "Sample_file_name"
+pheno <- merge(pheno, tss, by = "Sample_file_name", all.x = TRUE)
+
+# NRF = Non-redundant fraction
+# PBC1/2 = PCR bottleneck coefficients (1 = ideal, <0.5 = poor complexity)
+pbc <- read.table("/mnt/IM/groupMansuy/theresa/ATAC/MSUS39F1/results_mm10/02_qc_plots/10_pbc_metrics/combined_PBC_Metrics.txt", header = TRUE, sep = "\t")
+colnames(pbc)[colnames(pbc) == "Sample"] <- "Sample_file_name"
+pheno <- merge(pheno, pbc, by = "Sample_file_name", all.x = TRUE)
+
+# Final sample identifier column
+pheno$Sample <- pheno$Sample_file_name
+
+# Save final phenotype table to CSV
+write.csv(pheno, "/mnt/IM/groupMansuy/anna/Bioinformatics_project/ATAC/pheno.csv", row.names = FALSE)
+```
+
+## 1.6 Load cleaned phenotype data
+```{r, verbose = FALSE}
+# Reload saved phenotype table (in case of workflow split)
+pheno <- read.csv("/mnt/IM/groupMansuy/anna/Bioinformatics_project/ATAC/pheno.csv")
+rownames(pheno) <- pheno$Sample
+```
+
+## 1.7 Correlation plot: all samples
+```{r, verbose = FALSE}
+# Define technical and QC variables to inspect
+PCAvariables <- c("cycles.PCR1", "cycles.PCR2", "TSS_Score", "NRF", "PBC1", "PBC2", "RNA.conc", colnames(multiQC_fastQ[[1]]))
+
+## Interactive heatmap: all samples
+# Retain only numeric variables with non-zero variance
+valid_vars <- PCAvariables[sapply(pheno[, PCAvariables], function(x) is.numeric(x) && sd(x, na.rm = TRUE) > 0)]
+
+# Create interactive heatmap for visual correlation inspection
+heatmaply_cor(x = cor(pheno[, valid_vars], use = "pairwise.complete.obs"), xlab = "Features", ylab = "Features", show_dendrogram = c(TRUE, FALSE), plot_method = "plotly", file = "/mnt/groupMansuy/anna/Bioinformatics_project/ATAC/results/tec_vars_03/TechnicalVariablesCorrelationsHeatmaply.html")
+```
+
+## 1.8 Correlation: PND15 (Pups)
+```{r, verbose = FALSE}
+# Define valid variables again for PND15 samples only
+valid_vars_pups <- PCAvariables[sapply(pheno[pheno$Age == "PND15", PCAvariables], function(x) {
+  is.numeric(x) && sd(x, na.rm = TRUE) > 0 && !all(is.na(x))
+})]
+
+# Interactive version
+heatmaply_cor(x = cor(pheno[pheno$Age == "PND15", valid_vars_pups], use = "pairwise.complete.obs"), xlab = "Features", ylab = "Features", show_dendrogram = c(TRUE, FALSE), plot_method = "plotly", file = "/mnt/groupMansuy/anna/Bioinformatics_project/ATAC/results/tec_vars_03/TechnicalVariablesCorrelationsHeatmaply_only_pups.html")
+```
+
+## 1.9 Correlation: Adults
+```{r, verbose = FALSE}
+# Define valid variables again for adults samples only
+valid_vars_adults <- PCAvariables[sapply(pheno[pheno$Age == "Adult", PCAvariables], function(x) {
+  is.numeric(x) && sd(x, na.rm = TRUE) > 0 && !all(is.na(x))
+})]
+
+# Interactive version
+heatmaply_cor(x = cor(pheno[pheno$Age == "Adult", valid_vars_adults], use = "pairwise.complete.obs"), xlab = "Features", ylab = "Features", show_dendrogram = c(TRUE, FALSE), plot_method = "plotly", file = "/mnt/groupMansuy/anna/Bioinformatics_project/ATAC/results/tec_vars_03/TechnicalVariablesCorrelationsHeatmaply_only_adults.html")
+```
+
+## 1.10 Interpretation
+The correlation analysis of technical quality control (QC) metrics across all samples, as well as stratified by age group (PND15 pups and adults), provides insight into the consistency and potential confounding variables within the ATAC-seq data.  
+Across the entire dataset, several moderate to strong correlations are observed between metrics related to library complexity and sequencing quality. Notably, PBC1 and NRF, which both assess library redundancy, show strong positive correlation as expected, reflecting that higher non-redundant fractions co-occur with reduced PCR bottlenecking. There is also a clear inverse relationship between percent duplicates and NRF/PBC1, confirming that more duplication is associated with lower library complexity.  
+In the PND15 subset, correlations largely mirror those of the full dataset but appear slightly weaker overall, possibly due to smaller sample size or more homogeneous technical conditions. Interestingly, TSS enrichment score (a proxy for signal-to-noise) is only modestly correlated with most library metrics, suggesting that chromatin accessibility signal quality is relatively independent of metrics like input concentration or PCR cycles in these samples.  
+For adult samples, the same general patterns hold, but correlations between TSS score and both PBC1 and NRF are slightly stronger than in pups. This might suggest that in adult spermatogonial stem cells, overall chromatin signal quality is more tightly linked to library complexity than in early developmental stages.  
+These findings emphasize that certain QC metrics—especially duplication rate, NRF, and PBC1—are redundant and tightly coupled, while TSS enrichment, GC content, and RNA concentration vary more independently and may better reflect biological variation or technical noise. These relationships can help guide the choice of covariates in downstream normalization or correction steps, especially if differential accessibility.   
+To account for unwanted technical and biological variation during downstream differential accessibility analysis, we plan to apply a Surrogate Variable Analysis (SVA) approach. This unsupervised method helps identify latent sources of variation that may or may not be captured by known covariates, providing a robust correction strategy that avoids overfitting to technical metrics alone. This will be especially useful to ensure that observed differences in chromatin accessibility reflect the biological effects of early life stress, rather than residual technical or confounding biases. To evaluate the effectiveness of this correction, we will assess the correlation between principal components of the accessibility matrix (e.g., read counts over peaks) and known covariates before and after applying SVA, which will help determine whether unwanted variation has been reduced without masking  biological signals.
